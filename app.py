@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import queue
 import sys
 import threading
@@ -17,16 +18,10 @@ BYTES_PER_ROW = 16
 SERIAL_BAUDRATE = 115200
 SERIAL_TIMEOUT = 1.0
 BSND_CHUNK_SIZE = 256
-ADDRESS_COLUMN_WIDTH = 6
 HEX_COLUMN_WIDTH = (BYTES_PER_ROW * 3) - 1
-ASCII_COLUMN_START = ADDRESS_COLUMN_WIDTH + HEX_COLUMN_WIDTH + 2
-RULER_TEXT = (
-    "ADDR  "
-    + " ".join(f"+{index:X}" for index in range(BYTES_PER_ROW))
-    + "  0123456789ABCDEF"
-)
 SAVE_START_CHOICES = ("0000", "4000", "8000", "C000")
 SAVE_END_CHOICES = ("3FFF", "7FFF", "BFFF", "FFFF")
+SAVE_BANK_CHOICES = tuple(f"{bank:02X}" for bank in range(0x100))
 DEFAULT_SLOT = 1
 TOOLBAR_JUMP_ADDRESSES = (
     ("00", 0x0000),
@@ -35,11 +30,54 @@ TOOLBAR_JUMP_ADDRESSES = (
     ("C0", 0xC000),
     ("FF", 0xFFFF),
 )
+FLAT_MODE = "flat"
+MAPPER_MODE = "mapper"
+FLAT_HEADER_PREFIX = "ADDR"
+MAPPER_HEADER_PREFIX = "FulAdr:Bk:Ofst"
+WINDOW_CHOICES = (
+    "4000-5FFF(8k)",
+    "4000-7FFF(16k)",
+    "8000-9FFF(8k)",
+    "8000-BFFF(16k)",
+)
+WINDOW_CONFIGS = {
+    "4000-5FFF(8k)": (0x4000, 0x2000),
+    "4000-7FFF(16k)": (0x4000, 0x4000),
+    "8000-9FFF(8k)": (0x8000, 0x2000),
+    "8000-BFFF(16k)": (0x8000, 0x4000),
+}
+SWITCH_ADDR_CHOICES = (
+    "6000",
+    "6800",
+    "7000",
+    "7800",
+    "8000",
+    "8800",
+    "9000",
+    "9800",
+)
+MAPPER_TYPE_CHOICES = (
+    "ASCII 8K",
+    "ASCII 16K",
+    "Konami",
+    "Custom",
+)
+MAPPER_PRESETS = {
+    "ASCII 8K": ("4000-5FFF(8k)", "6000"),
+    "ASCII 16K": ("4000-7FFF(16k)", "6000"),
+    "Konami": ("4000-5FFF(8k)", "5000"),
+    "Custom": ("4000-5FFF(8k)", "6000"),
+}
+DEFAULT_MAPPER_TYPE = "ASCII 8K"
+DEFAULT_WINDOW = MAPPER_PRESETS[DEFAULT_MAPPER_TYPE][0]
+DEFAULT_SWITCH_ADDR = MAPPER_PRESETS[DEFAULT_MAPPER_TYPE][1]
+APP_VERSION = "v0.2"
+APP_TITLE = f"MSX Game Cartidge Adapter GUI {APP_VERSION}"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="MSXPLAYer Game Cartidge Adapter GUI"
+        description="MSX Game Cartidge Adapter GUI"
     )
     parser.add_argument(
         "--device",
@@ -69,6 +107,13 @@ def parse_hex_address(text: str) -> int:
     if any(ch not in "0123456789ABCDEF" for ch in normalized):
         raise ValueError("format")
     return int(normalized, 16)
+
+
+def parse_hex_byte(text: str) -> int:
+    value = parse_hex_address(text)
+    if value > 0xFF:
+        raise ValueError("range")
+    return value
 
 
 def discover_serial_devices() -> list[tuple[str, str]]:
@@ -204,6 +249,11 @@ class CartridgeAdapter:
         )
 
     def close(self) -> None:
+        if self._slot_power_on:
+            try:
+                self._transport.execute_command("SPOFF")
+            except Exception:
+                pass
         self._transport.close()
 
     def get_version_info(self) -> list[str]:
@@ -217,6 +267,53 @@ class CartridgeAdapter:
 
     def read_cartridge_64kb(self, progress_callback) -> bytes:
         return self._read_full_buffer(progress_callback)
+
+    def read_slot_range(
+        self,
+        address: int,
+        length: int,
+        progress_callback=None,
+    ) -> bytes:
+        self._ensure_power_on()
+        self._transport.execute_command(
+            f"SMTR,{address:04X},{length:04X},0000,{DEFAULT_SLOT}"
+        )
+        self._transport.send_command_without_result(f"BSND,0000,{length:04X}")
+        payload = self._transport.read_binary(length, progress_callback or (lambda _offset: None))
+        self._transport.receive_command_result()
+        return payload
+
+    def read_mapper_bank(
+        self,
+        bank: int,
+        switch_addr: int,
+        window_start: int,
+        window_length: int,
+        progress_callback=None,
+    ) -> bytes:
+        self._ensure_power_on()
+        self._transport.execute_command(
+            f"SMWR,{switch_addr:04X},{bank:02X},{DEFAULT_SLOT}"
+        )
+        return self.read_slot_range(window_start, window_length, progress_callback)
+
+    def write_mapper_byte_and_read_bank(
+        self,
+        bank: int,
+        switch_addr: int,
+        window_start: int,
+        window_length: int,
+        offset: int,
+        value: int,
+    ) -> bytes:
+        self._ensure_power_on()
+        self._transport.execute_command(
+            f"SMWR,{switch_addr:04X},{bank:02X},{DEFAULT_SLOT}"
+        )
+        self._transport.execute_command(
+            f"SMWR,{window_start + offset:04X},{value:02X},{DEFAULT_SLOT}"
+        )
+        return self.read_slot_range(window_start, window_length)
 
     def write_byte(self, address: int, value: int) -> None:
         self._ensure_power_on()
@@ -261,19 +358,32 @@ class CartridgeAdapter:
 
 
 class SaveBufferDialog(tk.Toplevel):
-    def __init__(self, master: tk.Misc) -> None:
+    def __init__(
+        self,
+        master: tk.Misc,
+        initial_mode: str,
+        mapper_defaults: dict[str, str],
+        analyzed_end_bank: str,
+    ) -> None:
         super().__init__(master)
-        self.result: tuple[str, int, int] | None = None
+        self.result: dict[str, object] | None = None
 
         self.title("バッファ保存")
         self.resizable(False, False)
         self.transient(master)
         self.grab_set()
 
-        self.path_var = tk.StringVar(value="msx_adapter_dump.bin")
+        self.path_var = tk.StringVar(value="msx_adapter_dump.rom")
+        self.mode_var = tk.StringVar(value=initial_mode)
         self.start_var = tk.StringVar(value=SAVE_START_CHOICES[0])
         self.end_var = tk.StringVar(value=SAVE_END_CHOICES[-1])
+        self.mapper_type_var = tk.StringVar(value=mapper_defaults["mapper_type"])
+        self.window_var = tk.StringVar(value=mapper_defaults["window_label"])
+        self.switch_var = tk.StringVar(value=mapper_defaults["switch_addr"])
+        self.start_bank_var = tk.StringVar(value="00")
+        self.end_bank_var = tk.StringVar(value=analyzed_end_bank)
         self.error_var = tk.StringVar(value="")
+        self._updating_mapper_controls = False
 
         self.columnconfigure(0, weight=1)
         frame = ttk.Frame(self, padding=12)
@@ -285,37 +395,103 @@ class SaveBufferDialog(tk.Toplevel):
         path_entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
         ttk.Button(frame, text="参照", command=self._browse).grid(row=0, column=2)
 
-        ttk.Label(frame, text="開始アドレス").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        start_combo = ttk.Combobox(
-            frame,
+        mode_frame = ttk.Frame(frame)
+        mode_frame.grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Radiobutton(mode_frame, text="Flat", variable=self.mode_var, value="flat", command=self._update_mode_state).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(mode_frame, text="Mapper", variable=self.mode_var, value="mapper", command=self._update_mode_state).grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+        self.flat_frame = ttk.LabelFrame(frame, text="Flat", padding=8)
+        self.flat_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        self.flat_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(self.flat_frame, text="開始アドレス").grid(row=0, column=0, sticky="w")
+        self.start_combo = ttk.Combobox(
+            self.flat_frame,
             textvariable=self.start_var,
             values=SAVE_START_CHOICES,
             width=10,
         )
-        start_combo.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
+        self.start_combo.grid(row=0, column=1, sticky="w", padx=(8, 0))
 
-        ttk.Label(frame, text="終了アドレス").grid(row=2, column=0, sticky="w", pady=(10, 0))
-        end_combo = ttk.Combobox(
-            frame,
+        ttk.Label(self.flat_frame, text="終了アドレス").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.end_combo = ttk.Combobox(
+            self.flat_frame,
             textvariable=self.end_var,
             values=SAVE_END_CHOICES,
             width=10,
         )
-        end_combo.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
+        self.end_combo.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
+
+        self.mapper_frame = ttk.LabelFrame(frame, text="Mapper", padding=8)
+        self.mapper_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        self.mapper_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(self.mapper_frame, text="Type").grid(row=0, column=0, sticky="w")
+        self.mapper_type_combo = ttk.Combobox(
+            self.mapper_frame,
+            textvariable=self.mapper_type_var,
+            values=MAPPER_TYPE_CHOICES,
+            state="readonly",
+            width=12,
+        )
+        self.mapper_type_combo.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.mapper_type_combo.bind("<<ComboboxSelected>>", self._on_mapper_type_selected)
+
+        ttk.Label(self.mapper_frame, text="Window").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.window_combo = ttk.Combobox(
+            self.mapper_frame,
+            textvariable=self.window_var,
+            values=WINDOW_CHOICES,
+            state="readonly",
+            width=16,
+        )
+        self.window_combo.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
+        self.window_combo.bind("<<ComboboxSelected>>", self._on_mapper_setting_changed)
+
+        ttk.Label(self.mapper_frame, text="Switch").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self.switch_combo = ttk.Combobox(
+            self.mapper_frame,
+            textvariable=self.switch_var,
+            values=SWITCH_ADDR_CHOICES,
+            width=8,
+        )
+        self.switch_combo.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
+        self.switch_combo.bind("<<ComboboxSelected>>", self._on_mapper_setting_changed)
+        self.switch_combo.bind("<FocusOut>", self._on_mapper_setting_changed)
+        self.switch_combo.bind("<Return>", self._on_mapper_setting_changed)
+
+        ttk.Label(self.mapper_frame, text="StartBank").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        self.start_bank_combo = ttk.Combobox(
+            self.mapper_frame,
+            textvariable=self.start_bank_var,
+            values=SAVE_BANK_CHOICES,
+            width=6,
+        )
+        self.start_bank_combo.grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
+
+        ttk.Label(self.mapper_frame, text="EndBank").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        self.end_bank_combo = ttk.Combobox(
+            self.mapper_frame,
+            textvariable=self.end_bank_var,
+            values=SAVE_BANK_CHOICES,
+            width=6,
+        )
+        self.end_bank_combo.grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
 
         error_label = ttk.Label(frame, textvariable=self.error_var, foreground="#c62828")
-        error_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        error_label.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         button_frame = ttk.Frame(frame)
-        button_frame.grid(row=4, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        button_frame.grid(row=5, column=0, columnspan=3, sticky="e", pady=(12, 0))
         ttk.Button(button_frame, text="キャンセル", command=self._cancel).grid(row=0, column=0)
         ttk.Button(button_frame, text="保存", command=self._submit).grid(row=0, column=1, padx=(8, 0))
 
         self.bind("<Return>", lambda _event: self._submit())
         self.bind("<Escape>", lambda _event: self._cancel())
+        self._update_mode_state()
         path_entry.focus_set()
 
-    def show(self) -> tuple[str, int, int] | None:
+    def show(self) -> dict[str, object] | None:
         self.wait_window()
         return self.result
 
@@ -323,47 +499,107 @@ class SaveBufferDialog(tk.Toplevel):
         path = filedialog.asksaveasfilename(
             parent=self,
             title="保存先選択",
-            defaultextension=".bin",
+            defaultextension=".rom",
             filetypes=[
-                ("Binary", "*.bin"),
                 ("ROM", "*.rom"),
+                ("Binary", "*.bin"),
                 ("All files", "*"),
             ],
-            initialfile=self.path_var.get() or "msx_adapter_dump.bin",
+            initialfile=self.path_var.get() or "msx_adapter_dump.rom",
         )
         if path:
             self.path_var.set(path)
 
     def _submit(self) -> None:
         path = self.path_var.get().strip()
-        start_text = self.start_var.get().strip().upper()
-        end_text = self.end_var.get().strip().upper()
+        mode = self.mode_var.get()
 
         if not path:
             self.error_var.set("ファイル名を指定してください。")
             return
 
-        try:
-            start_address = parse_hex_address(start_text)
-            end_address = parse_hex_address(end_text)
-        except ValueError:
-            self.error_var.set("開始/終了アドレスは16進数で入力してください。")
-            return
-
-        if start_address > 0xFFFF or end_address > 0xFFFF:
-            self.error_var.set("開始/終了アドレスは0000-FFFFで入力してください。")
-            return
-
-        if start_address > end_address:
-            self.error_var.set("開始アドレスが終了アドレスを超えています。")
-            return
-
-        self.result = (path, start_address, end_address)
+        if mode == "flat":
+            start_text = self.start_var.get().strip().upper()
+            end_text = self.end_var.get().strip().upper()
+            try:
+                start_address = parse_hex_address(start_text)
+                end_address = parse_hex_address(end_text)
+            except ValueError:
+                self.error_var.set("開始/終了アドレスは16進数で入力してください。")
+                return
+            if start_address > 0xFFFF or end_address > 0xFFFF:
+                self.error_var.set("開始/終了アドレスは0000-FFFFで入力してください。")
+                return
+            if start_address > end_address:
+                self.error_var.set("開始アドレスが終了アドレスを超えています。")
+                return
+            self.result = {
+                "mode": "flat",
+                "path": path,
+                "start_address": start_address,
+                "end_address": end_address,
+            }
+        else:
+            switch_text = self.switch_var.get().strip().upper()
+            start_bank_text = self.start_bank_var.get().strip().upper()
+            end_bank_text = self.end_bank_var.get().strip().upper()
+            try:
+                switch_addr = parse_hex_address(switch_text)
+                start_bank = parse_hex_byte(start_bank_text)
+                end_bank = parse_hex_byte(end_bank_text)
+            except ValueError:
+                self.error_var.set("Switch, StartBank, EndBank は16進数で入力してください。")
+                return
+            if start_bank > end_bank:
+                self.error_var.set("StartBank が EndBank を超えています。")
+                return
+            self.result = {
+                "mode": "mapper",
+                "path": path,
+                "mapper_type": self.mapper_type_var.get(),
+                "window_label": self.window_var.get(),
+                "switch_addr": switch_addr,
+                "start_bank": start_bank,
+                "end_bank": end_bank,
+            }
         self.destroy()
 
     def _cancel(self) -> None:
         self.result = None
         self.destroy()
+
+    def _update_mode_state(self) -> None:
+        flat_enabled = self.mode_var.get() == "flat"
+        mapper_enabled = not flat_enabled
+        self.start_combo.configure(state="normal" if flat_enabled else "disabled")
+        self.end_combo.configure(state="normal" if flat_enabled else "disabled")
+        self.mapper_type_combo.configure(state="readonly" if mapper_enabled else "disabled")
+        self.window_combo.configure(state="readonly" if mapper_enabled else "disabled")
+        self.switch_combo.configure(state="normal" if mapper_enabled else "disabled")
+        self.start_bank_combo.configure(state="normal" if mapper_enabled else "disabled")
+        self.end_bank_combo.configure(state="normal" if mapper_enabled else "disabled")
+
+    def _on_mapper_type_selected(self, _event=None) -> None:
+        mapper_type = self.mapper_type_var.get()
+        preset = MAPPER_PRESETS.get(mapper_type)
+        if preset is None:
+            return
+        self._updating_mapper_controls = True
+        try:
+            self.window_var.set(preset[0])
+            self.switch_var.set(preset[1])
+        finally:
+            self._updating_mapper_controls = False
+
+    def _on_mapper_setting_changed(self, _event=None) -> None:
+        if self._updating_mapper_controls:
+            return None
+        current = (self.window_var.get(), self.switch_var.get().strip().upper())
+        self.switch_var.set(current[1])
+        preset = MAPPER_PRESETS.get(self.mapper_type_var.get())
+        if preset is None or current != preset:
+            self.mapper_type_var.set("Custom")
+        return None
 
 
 class SerialDeviceDialog(tk.Toplevel):
@@ -557,6 +793,177 @@ class ManualCommandDialog(tk.Toplevel):
         self._submit_callback(command)
 
 
+class MapperMapDialog(tk.Toplevel):
+    def __init__(self, master: tk.Misc, analyze_callback, select_bank_callback) -> None:
+        super().__init__(master)
+        self._analyze_callback = analyze_callback
+        self._select_bank_callback = select_bank_callback
+        self._cell_text_ids: dict[int, int] = {}
+        self.image_size_var = tk.StringVar(value="")
+        self.withdraw()
+
+        self.title("Mapper Map")
+        self.resizable(False, False)
+        self.transient(master)
+        self.attributes("-alpha", 0.0)
+
+        frame = ttk.Frame(self, padding=8)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        mono = font.nametofont("TkFixedFont")
+        self._header_size = 40
+        self._cell_width = 56
+        self._cell_height = 28
+        self._grid_width = self._header_size + (16 * self._cell_width)
+        self._grid_height = self._header_size + (16 * self._cell_height)
+        self.canvas = tk.Canvas(
+            frame,
+            width=self._grid_width,
+            height=self._grid_height,
+            background="#ffffff",
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+
+        self._draw_grid(mono)
+
+        button_frame = ttk.Frame(frame)
+        button_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        button_frame.columnconfigure(0, weight=1)
+        ttk.Label(button_frame, textvariable=self.image_size_var).grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=(0, 12),
+        )
+        self.analyze_button = ttk.Button(
+            button_frame,
+            text="Analyze",
+            command=self._analyze_callback,
+        )
+        self.analyze_button.grid(row=0, column=1)
+
+        self.update_idletasks()
+        self.after_idle(self._show_ready)
+
+    def _show_ready(self) -> None:
+        self.deiconify()
+        self.lift()
+        self.update_idletasks()
+        self.attributes("-alpha", 1.0)
+
+    def _draw_grid(self, mono) -> None:
+        self.canvas.delete("all")
+        line_color = "#808080"
+        text_color = "#000000"
+
+        self.canvas.create_rectangle(
+            0,
+            0,
+            self._grid_width,
+            self._grid_height,
+            outline=line_color,
+            fill="#ffffff",
+        )
+
+        for column in range(16):
+            x1 = self._header_size + (column * self._cell_width)
+            x2 = x1 + self._cell_width
+            self.canvas.create_rectangle(
+                x1,
+                0,
+                x2,
+                self._header_size,
+                outline=line_color,
+                fill="#f5f5f5",
+            )
+            self.canvas.create_text(
+                x1 + (self._cell_width / 2),
+                self._header_size / 2,
+                text=f"+{column:X}",
+                font=mono,
+                fill=text_color,
+            )
+
+        for row in range(16):
+            y1 = self._header_size + (row * self._cell_height)
+            y2 = y1 + self._cell_height
+            self.canvas.create_rectangle(
+                0,
+                y1,
+                self._header_size,
+                y2,
+                outline=line_color,
+                fill="#f5f5f5",
+            )
+            self.canvas.create_text(
+                self._header_size / 2,
+                y1 + (self._cell_height / 2),
+                text=f"+{row * 0x10:02X}",
+                font=mono,
+                fill=text_color,
+            )
+            for column in range(16):
+                bank = (row * 16) + column
+                x1 = self._header_size + (column * self._cell_width)
+                x2 = x1 + self._cell_width
+                tag = f"cell_{bank:02X}"
+                self.canvas.create_rectangle(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    outline=line_color,
+                    fill="#ffffff",
+                    tags=(tag,),
+                )
+                text_id = self.canvas.create_text(
+                    x1 + (self._cell_width / 2),
+                    y1 + (self._cell_height / 2),
+                    text=f"{bank:02X}",
+                    font=mono,
+                    fill=text_color,
+                    tags=(tag,),
+                )
+                self._cell_text_ids[bank] = text_id
+                self.canvas.tag_bind(tag, "<Button-1>", lambda _event, b=bank: self._on_cell_click(b))
+
+    def reset_cells(self) -> None:
+        self.image_size_var.set("")
+        for bank, text_id in self._cell_text_ids.items():
+            self.canvas.itemconfigure(
+                text_id,
+                text=f"{bank:02X}",
+                fill="#000000",
+            )
+
+    def set_image_size(self, text: str) -> None:
+        self.image_size_var.set(text)
+
+    def mark_unique(self, bank: int) -> None:
+        self.canvas.itemconfigure(
+            self._cell_text_ids[bank],
+            text=f"{bank:02X}",
+            fill="#c62828",
+        )
+
+    def mark_mirror(self, bank: int, before: int) -> None:
+        self.canvas.itemconfigure(
+            self._cell_text_ids[bank],
+            text=f"({before:02X})",
+            fill="#808080",
+        )
+
+    def set_busy(self, busy: bool) -> None:
+        self.analyze_button.configure(state="disabled" if busy else "normal")
+
+    def _on_cell_click(self, bank: int) -> None:
+        self._select_bank_callback(bank)
+
+
 class HexViewer(ttk.Frame):
     def __init__(
         self,
@@ -564,13 +971,21 @@ class HexViewer(ttk.Frame):
         data: bytes,
         on_change=None,
         on_byte_edited=None,
+        on_mapper_bank_move=None,
     ) -> None:
         super().__init__(master)
         self._on_change = on_change
         self._on_byte_edited = on_byte_edited
+        self._on_mapper_bank_move = on_mapper_bank_move
         self._original_data = bytearray(data)
         self._current_data = bytearray(data)
         self._changed_offsets: set[int] = set()
+        self._mode = FLAT_MODE
+        self._mapper_window_length = 0x2000
+        self._mapper_bank = 0
+        self._mapper_window_start = 0x4000
+        self._address_column_width = self._compute_address_column_width()
+        self._ascii_column_start = self._address_column_width + HEX_COLUMN_WIDTH + 2
         mono = font.nametofont("TkFixedFont")
         self._header = tk.Text(
             self,
@@ -622,6 +1037,21 @@ class HexViewer(ttk.Frame):
 
         self.set_data(data)
 
+    def configure_mode(
+        self,
+        mode: str,
+        mapper_window_length: int = 0x2000,
+        mapper_bank: int = 0,
+        mapper_window_start: int = 0x4000,
+    ) -> None:
+        self._mode = mode
+        self._mapper_window_length = mapper_window_length
+        self._mapper_bank = mapper_bank
+        self._mapper_window_start = mapper_window_start
+        self._address_column_width = self._compute_address_column_width()
+        self._ascii_column_start = self._address_column_width + HEX_COLUMN_WIDTH + 2
+        self._render_all()
+
     def set_data(
         self,
         data: bytes,
@@ -648,6 +1078,22 @@ class HexViewer(ttk.Frame):
 
     def has_changes(self) -> bool:
         return bool(self._changed_offsets)
+
+    def replace_slice(self, start: int, data: bytes) -> None:
+        if not data:
+            return
+        end = min(start + len(data), len(self._current_data))
+        payload = data[: end - start]
+        self._original_data[start:end] = payload
+        self._current_data[start:end] = payload
+        self._changed_offsets = {
+            offset for offset in self._changed_offsets if not (start <= offset < end)
+        }
+        start_row = start // BYTES_PER_ROW
+        end_row = (end - 1) // BYTES_PER_ROW
+        for row_index in range(start_row, end_row + 1):
+            self._update_row(row_index)
+        self._notify_change()
 
     def set_editable(self, editable: bool) -> None:
         self._editable = editable
@@ -683,8 +1129,8 @@ class HexViewer(ttk.Frame):
 
         self._header.configure(state="normal")
         self._header.delete("1.0", tk.END)
-        self._header.insert("1.0", RULER_TEXT)
-        self._header.tag_add("address_bg", "1.0", f"1.{ADDRESS_COLUMN_WIDTH}")
+        self._header.insert("1.0", self._header_text())
+        self._header.tag_add("address_bg", "1.0", f"1.{self._address_column_width}")
         self._header.configure(state="disabled")
         self._text.delete("1.0", tk.END)
         self._text.insert("1.0", "\n".join(lines))
@@ -694,15 +1140,15 @@ class HexViewer(ttk.Frame):
         row = self._current_data[base : base + BYTES_PER_ROW]
         hex_part = " ".join(f"{value:02X}" for value in row)
         ascii_part = "".join(to_printable(value) for value in row)
-        return f"{base:04X}  {hex_part:<{HEX_COLUMN_WIDTH}}  {ascii_part}"
+        return f"{self._format_address(base)}  {hex_part:<{HEX_COLUMN_WIDTH}}  {ascii_part}"
 
     def _apply_changed_tags(self) -> None:
         self._text.tag_remove("changed", "1.0", tk.END)
         for offset in self._changed_offsets:
             line_no = (offset // BYTES_PER_ROW) + 1
             byte_in_row = offset % BYTES_PER_ROW
-            hex_col = ADDRESS_COLUMN_WIDTH + (byte_in_row * 3)
-            ascii_col = ASCII_COLUMN_START + byte_in_row
+            hex_col = self._address_column_width + (byte_in_row * 3)
+            ascii_col = self._ascii_column_start + byte_in_row
             self._text.tag_add(
                 "changed",
                 f"{line_no}.{hex_col}",
@@ -718,7 +1164,11 @@ class HexViewer(ttk.Frame):
         self._text.tag_remove("address_bg", "1.0", tk.END)
         line_count = (len(self._current_data) + BYTES_PER_ROW - 1) // BYTES_PER_ROW
         for line_no in range(1, line_count + 1):
-            self._text.tag_add("address_bg", f"{line_no}.0", f"{line_no}.{ADDRESS_COLUMN_WIDTH}")
+            self._text.tag_add(
+                "address_bg",
+                f"{line_no}.0",
+                f"{line_no}.{self._address_column_width}",
+            )
 
     def _apply_cursor_line_tag(self) -> None:
         self._text.tag_remove("cursor_line", "1.0", tk.END)
@@ -729,7 +1179,7 @@ class HexViewer(ttk.Frame):
         self._header.tag_remove("cursor_byte", "1.0", tk.END)
         offset, _nibble = self._insert_position()
         byte_in_row = offset % BYTES_PER_ROW
-        start_col = ADDRESS_COLUMN_WIDTH + (byte_in_row * 3)
+        start_col = self._address_column_width + (byte_in_row * 3)
         self._header.tag_add(
             "cursor_byte",
             f"1.{start_col}",
@@ -807,6 +1257,9 @@ class HexViewer(ttk.Frame):
 
     def _handle_navigation(self, keysym: str, state: int = 0) -> None:
         offset, nibble = self._insert_position()
+        if self._mode == MAPPER_MODE:
+            if self._handle_mapper_navigation(offset, nibble, keysym, state):
+                return
         ctrl_pressed = bool(state & 0x0004)
         if keysym == "Left":
             if nibble == 1:
@@ -842,6 +1295,85 @@ class HexViewer(ttk.Frame):
             )
         self._move_cursor_to_offset(offset, nibble)
 
+    def _handle_mapper_navigation(
+        self,
+        offset: int,
+        nibble: int,
+        keysym: str,
+        state: int,
+    ) -> bool:
+        ctrl_pressed = bool(state & 0x0004)
+        window_length = len(self._current_data)
+        if window_length <= 0:
+            return False
+
+        full_offset = (self._mapper_bank * window_length) + offset
+        max_full_offset = (0x100 * window_length) - 1
+        target_full_offset = full_offset
+        target_nibble = nibble
+        moved = True
+
+        if keysym == "Left":
+            if nibble == 1:
+                target_nibble = 0
+            elif full_offset > 0:
+                target_full_offset -= 1
+                target_nibble = 1
+            else:
+                moved = False
+        elif keysym == "Right":
+            if nibble == 0:
+                target_nibble = 1
+            elif full_offset < max_full_offset:
+                target_full_offset += 1
+                target_nibble = 0
+            else:
+                moved = False
+        elif keysym == "Up":
+            if full_offset >= BYTES_PER_ROW:
+                target_full_offset -= BYTES_PER_ROW
+            else:
+                moved = False
+        elif keysym == "Down":
+            if full_offset + BYTES_PER_ROW <= max_full_offset:
+                target_full_offset += BYTES_PER_ROW
+            else:
+                moved = False
+        elif keysym == "Home":
+            target_full_offset -= offset % BYTES_PER_ROW
+            target_nibble = 0
+        elif keysym == "End":
+            row_start = full_offset - (offset % BYTES_PER_ROW)
+            target_full_offset = min(row_start + (BYTES_PER_ROW - 1), max_full_offset)
+            target_nibble = 1
+        elif keysym == "Prior":
+            delta = 0x800 if ctrl_pressed else 0x100
+            if full_offset >= delta:
+                target_full_offset -= delta
+            else:
+                moved = False
+        elif keysym == "Next":
+            delta = 0x800 if ctrl_pressed else 0x100
+            if full_offset + delta <= max_full_offset:
+                target_full_offset += delta
+            else:
+                moved = False
+        else:
+            return False
+
+        if not moved:
+            return True
+
+        target_bank = target_full_offset // window_length
+        target_offset = target_full_offset % window_length
+        if target_bank == self._mapper_bank:
+            self._move_cursor_to_offset(target_offset, target_nibble)
+            return True
+
+        if self._on_mapper_bank_move is None:
+            return True
+        return bool(self._on_mapper_bank_move(target_bank, target_offset, target_nibble))
+
     def _update_row(self, row_index: int) -> None:
         base = row_index * BYTES_PER_ROW
         line_no = row_index + 1
@@ -863,14 +1395,14 @@ class HexViewer(ttk.Frame):
         row_offset = (line - 1) * BYTES_PER_ROW
         last_row_bytes = min(BYTES_PER_ROW, len(self._current_data) - row_offset)
 
-        if col < ADDRESS_COLUMN_WIDTH:
+        if col < self._address_column_width:
             byte_in_row = 0
             nibble = 0
-        elif col >= ASCII_COLUMN_START:
-            byte_in_row = min(max(col - ASCII_COLUMN_START, 0), last_row_bytes - 1)
+        elif col >= self._ascii_column_start:
+            byte_in_row = min(max(col - self._ascii_column_start, 0), last_row_bytes - 1)
             nibble = 0
         else:
-            relative = max(col - ADDRESS_COLUMN_WIDTH, 0)
+            relative = max(col - self._address_column_width, 0)
             byte_in_row = min(relative // 3, last_row_bytes - 1)
             nibble = 1 if (relative % 3) >= 1 else 0
         return row_offset + byte_in_row, nibble
@@ -884,7 +1416,7 @@ class HexViewer(ttk.Frame):
         offset = min(max(offset, 0), len(self._current_data) - 1)
         line_no = (offset // BYTES_PER_ROW) + 1
         byte_in_row = offset % BYTES_PER_ROW
-        column = ADDRESS_COLUMN_WIDTH + (byte_in_row * 3) + nibble
+        column = self._address_column_width + (byte_in_row * 3) + nibble
         index = f"{line_no}.{column}"
         self._text.mark_set("insert", index)
         if not keep_view:
@@ -907,6 +1439,23 @@ class HexViewer(ttk.Frame):
         self._header.xview(*args)
         self._text.xview(*args)
 
+    def _compute_address_column_width(self) -> int:
+        return len(self._format_address(0)) + 2
+
+    def _format_address(self, base: int) -> str:
+        if self._mode == MAPPER_MODE:
+            full_address = (self._mapper_bank * self._mapper_window_length) + base
+            return f"{full_address:06X}:{self._mapper_bank:02X}:{base:04X}"
+        return f"{base:04X}"
+
+    def _header_text(self) -> str:
+        prefix = FLAT_HEADER_PREFIX if self._mode == FLAT_MODE else MAPPER_HEADER_PREFIX
+        return (
+            prefix.ljust(self._address_column_width)
+            + " ".join(f"+{index:X}" for index in range(BYTES_PER_ROW))
+            + "  0123456789ABCDEF"
+        )
+
 
 class AdapterApp(tk.Tk):
     def __init__(self, device: str, debug: bool) -> None:
@@ -915,23 +1464,46 @@ class AdapterApp(tk.Tk):
         self.selected_device = device
         self.debug = debug
         self.buffer = bytes(BUFFER_SIZE)
+        self.flat_buffer = bytes(BUFFER_SIZE)
+        self.mapper_buffer = bytes(WINDOW_CONFIGS[DEFAULT_WINDOW][1])
         self._event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._adapter: CartridgeAdapter | None = None
         self._busy = False
         self._access_log_lines: list[str] = []
         self._access_log_dialog: AccessLogDialog | None = None
         self._manual_dialog: ManualCommandDialog | None = None
+        self._mapper_map_dialog: MapperMapDialog | None = None
+        self._updating_mapper_controls = False
+        self._pending_mapper_cursor: tuple[int, int] | None = None
+        self._last_analyzed_unique_banks: int | None = None
+        self._current_mode = FLAT_MODE
+        self._current_mapper_window_length = WINDOW_CONFIGS[DEFAULT_WINDOW][1]
+        self._current_mapper_window_start = WINDOW_CONFIGS[DEFAULT_WINDOW][0]
+        self._current_mapper_bank = 0
 
-        self.title("MSXPLAYer Game Cartidge Adapter")
+        self.title(APP_TITLE)
         self.geometry("980x760")
         self.minsize(720, 480)
 
-        self.status_var = tk.StringVar(value="device: not selected / select serial")
+        self.status_var = tk.StringVar(value=self._disconnected_status())
+        self.mapper_enabled_var = tk.BooleanVar(value=False)
+        self.mapper_type_var = tk.StringVar(value=DEFAULT_MAPPER_TYPE)
+        self.window_var = tk.StringVar(value=DEFAULT_WINDOW)
+        self.switch_addr_var = tk.StringVar(value=DEFAULT_SWITCH_ADDR)
+        self.bank_var = tk.StringVar(value="00")
 
         self._build_menu()
         self._build_toolbar()
+        self._build_mapper_bar()
         self._build_layout()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if self.selected_device:
+            self.after_idle(lambda: self._start_device_switch(self.selected_device, startup=True))
+
+    def _disconnected_status(self) -> str:
+        if self.selected_device:
+            return f"device: {self.selected_device} / selected / not connected"
+        return "device: not selected / select serial"
 
     def _build_menu(self) -> None:
         menu_bar = tk.Menu(self)
@@ -971,6 +1543,75 @@ class AdapterApp(tk.Tk):
                 command=lambda addr=address: self._scroll_to_address(addr),
             ).pack(side="right")
 
+    def _build_mapper_bar(self) -> None:
+        mapper_bar = ttk.Frame(self, padding=(8, 0, 8, 4))
+        mapper_bar.pack(side="top", fill="x")
+
+        self.mapper_toggle = ttk.Checkbutton(
+            mapper_bar,
+            text="Mapper",
+            variable=self.mapper_enabled_var,
+            command=self._on_mapper_mode_toggle,
+        )
+        self.mapper_toggle.pack(side="left")
+
+        ttk.Label(mapper_bar, text="Type:").pack(side="left", padx=(12, 4))
+        self.mapper_type_combo = ttk.Combobox(
+            mapper_bar,
+            textvariable=self.mapper_type_var,
+            values=MAPPER_TYPE_CHOICES,
+            state="readonly",
+            width=12,
+        )
+        self.mapper_type_combo.pack(side="left")
+        self.mapper_type_combo.bind("<<ComboboxSelected>>", self._on_mapper_type_selected)
+
+        ttk.Label(mapper_bar, text="Window:").pack(side="left", padx=(12, 4))
+        self.window_combo = ttk.Combobox(
+            mapper_bar,
+            textvariable=self.window_var,
+            values=WINDOW_CHOICES,
+            state="readonly",
+            width=16,
+        )
+        self.window_combo.pack(side="left")
+        self.window_combo.bind("<<ComboboxSelected>>", self._on_window_selected)
+
+        ttk.Label(mapper_bar, text="Switch:").pack(side="left", padx=(12, 4))
+        self.switch_addr_combo = ttk.Combobox(
+            mapper_bar,
+            textvariable=self.switch_addr_var,
+            values=SWITCH_ADDR_CHOICES,
+            width=8,
+        )
+        self.switch_addr_combo.pack(side="left")
+        self.switch_addr_combo.bind("<<ComboboxSelected>>", self._on_switch_addr_changed)
+        self.switch_addr_combo.bind("<FocusOut>", self._on_switch_addr_changed)
+        self.switch_addr_combo.bind("<Return>", self._on_switch_addr_changed)
+
+        ttk.Label(mapper_bar, text="Bank:").pack(side="left", padx=(12, 4))
+        self.bank_spinbox = ttk.Spinbox(
+            mapper_bar,
+            textvariable=self.bank_var,
+            values=tuple(f"{bank:02X}" for bank in range(0x100)),
+            width=4,
+            wrap=True,
+            command=self._on_bank_changed,
+        )
+        self.bank_spinbox.pack(side="left")
+        self.bank_spinbox.bind("<FocusOut>", self._on_bank_changed)
+        self.bank_spinbox.bind("<Return>", self._on_bank_changed)
+
+        self.map_button = ttk.Button(
+            mapper_bar,
+            text="Map",
+            command=self._open_mapper_map_dialog,
+            width=6,
+        )
+        self.map_button.pack(side="left", padx=(12, 0))
+
+        self._set_mapper_controls_enabled(False)
+
     def _build_layout(self) -> None:
         main = ttk.Frame(self, padding=(8, 4, 8, 8))
         main.pack(fill="both", expand=True)
@@ -985,6 +1626,7 @@ class AdapterApp(tk.Tk):
             self.buffer,
             on_change=self._on_hex_change,
             on_byte_edited=self._on_hex_byte_edited,
+            on_mapper_bank_move=self._on_mapper_bank_move,
         )
         self.hex_viewer.grid(row=0, column=0, sticky="nsew")
         hex_frame.grid(row=0, column=0, sticky="nsew")
@@ -992,11 +1634,236 @@ class AdapterApp(tk.Tk):
         status = ttk.Frame(main)
         status.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         status.columnconfigure(0, weight=1)
+        status.columnconfigure(1, weight=0)
 
         ttk.Label(status, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
+        self.progress_bar = ttk.Progressbar(
+            status,
+            orient="horizontal",
+            mode="determinate",
+            length=220,
+            maximum=0x100,
+        )
+        self.progress_bar.grid(row=0, column=1, sticky="e")
+        self.progress_bar.grid_remove()
 
     def _not_implemented(self) -> None:
         messagebox.showinfo("未実装", "この機能は次の段階で実装します。")
+
+    def _set_mapper_controls_enabled(self, enabled: bool) -> None:
+        state = "readonly" if enabled else "disabled"
+        self.mapper_type_combo.configure(state=state)
+        self.window_combo.configure(state=state)
+        self.switch_addr_combo.configure(state="normal" if enabled else "disabled")
+        self.bank_spinbox.configure(state="normal" if enabled else "disabled")
+        self._update_map_button_state()
+
+    def _update_map_button_state(self) -> None:
+        enabled = (
+            self.mapper_enabled_var.get()
+            and self._adapter is not None
+            and not self._busy
+        )
+        self.map_button.configure(state="normal" if enabled else "disabled")
+        if self._mapper_map_dialog is not None and self._mapper_map_dialog.winfo_exists():
+            self._mapper_map_dialog.set_busy(self._busy)
+
+    def _set_progress_visible(self, visible: bool, value: int = 0, maximum: int = 0x100) -> None:
+        if visible:
+            self.progress_bar.configure(maximum=maximum, value=value)
+            self.progress_bar.grid()
+        else:
+            self.progress_bar.grid_remove()
+
+    def _window_config(self) -> tuple[int, int]:
+        return WINDOW_CONFIGS[self.window_var.get()]
+
+    def _switch_addr_value(self) -> int:
+        return parse_hex_address(self.switch_addr_var.get())
+
+    def _build_dump_config(self) -> dict[str, object]:
+        window_label = self.window_var.get()
+        window_start, window_length = WINDOW_CONFIGS[window_label]
+        return {
+            "mode": MAPPER_MODE if self.mapper_enabled_var.get() else FLAT_MODE,
+            "mapper_type": self.mapper_type_var.get(),
+            "window_label": window_label,
+            "window_start": window_start,
+            "window_length": window_length,
+            "switch_addr": self._switch_addr_value(),
+            "bank": self._bank_value(),
+        }
+
+    def _validated_dump_config(self) -> dict[str, object] | None:
+        try:
+            return self._build_dump_config()
+        except ValueError:
+            messagebox.showerror(
+                "入力エラー",
+                "Mapper の設定値が不正です。\nSwitchAddr と Bank を確認してください。",
+            )
+            return None
+
+    def _bank_value(self) -> int:
+        return parse_hex_byte(self.bank_var.get())
+
+    def _apply_mapper_preset(self, mapper_type: str) -> None:
+        window_label, switch_addr = MAPPER_PRESETS[mapper_type]
+        self._updating_mapper_controls = True
+        try:
+            self.mapper_type_var.set(mapper_type)
+            self.window_var.set(window_label)
+            self.switch_addr_var.set(switch_addr)
+        finally:
+            self._updating_mapper_controls = False
+
+    def _sync_mapper_type_to_custom(self) -> None:
+        if self._updating_mapper_controls:
+            return
+        current = (self.window_var.get(), self.switch_addr_var.get().strip().upper())
+        preset = MAPPER_PRESETS.get(self.mapper_type_var.get())
+        if preset is None or current != preset:
+            self.mapper_type_var.set("Custom")
+
+    def _apply_display_buffer(
+        self,
+        mode: str,
+        data: bytes,
+        mapper_window_length: int,
+        mapper_window_start: int,
+        mapper_bank: int,
+    ) -> None:
+        self._current_mode = mode
+        self._current_mapper_window_length = mapper_window_length
+        self._current_mapper_window_start = mapper_window_start
+        self._current_mapper_bank = mapper_bank
+        self.hex_viewer.configure_mode(
+            mode,
+            mapper_window_length,
+            mapper_bank=mapper_bank,
+            mapper_window_start=mapper_window_start,
+        )
+        self.buffer = data
+        self.hex_viewer.set_data(self.buffer)
+
+    def _apply_zero_view(self) -> None:
+        self._set_mapper_controls_enabled(self.mapper_enabled_var.get())
+        if self.mapper_enabled_var.get():
+            mapper_window_start, mapper_window_length = self._window_config()
+            mapper_bank = self._bank_value()
+            self.mapper_buffer = bytes(mapper_window_length)
+            self._apply_display_buffer(
+                MAPPER_MODE,
+                self.mapper_buffer,
+                mapper_window_length,
+                mapper_window_start,
+                mapper_bank,
+            )
+        else:
+            self.flat_buffer = bytes(BUFFER_SIZE)
+            self._apply_display_buffer(FLAT_MODE, self.flat_buffer, BUFFER_SIZE, 0, 0)
+
+    def _apply_loaded_data(self, data: bytes, config: dict[str, object]) -> None:
+        mode = str(config["mode"])
+        if mode == MAPPER_MODE:
+            mapper_window_length = int(config["window_length"])
+            mapper_window_start = int(config["window_start"])
+            mapper_bank = int(config["bank"])
+            self.mapper_enabled_var.set(True)
+            self._set_mapper_controls_enabled(True)
+            self.bank_var.set(f"{mapper_bank:02X}")
+            self.mapper_buffer = data
+            self._apply_display_buffer(
+                MAPPER_MODE,
+                self.mapper_buffer,
+                mapper_window_length,
+                mapper_window_start,
+                mapper_bank,
+            )
+        else:
+            self.mapper_enabled_var.set(False)
+            self._set_mapper_controls_enabled(False)
+            self.flat_buffer = data
+            self._apply_display_buffer(FLAT_MODE, self.flat_buffer, BUFFER_SIZE, 0, 0)
+
+    def _refresh_current_mode_dump(self) -> None:
+        if self._busy:
+            return
+        self._set_mapper_controls_enabled(self.mapper_enabled_var.get())
+        if self._adapter is None:
+            self._apply_zero_view()
+            return
+        if self._validated_dump_config() is None:
+            return
+        self._start_dump_worker()
+
+    def _start_dump_worker(self) -> None:
+        if self._adapter is None:
+            return
+        config = self._build_dump_config()
+        self._set_busy(True)
+        if config["mode"] == MAPPER_MODE:
+            self._current_mapper_window_length = int(config["window_length"])
+            self.status_var.set(f"device: {self.device} / mapper dumping")
+            self._set_progress_visible(True, 0, int(config["window_length"]))
+            worker = threading.Thread(
+                target=self._mapper_dump_worker,
+                args=(config,),
+                daemon=True,
+            )
+        else:
+            self.status_var.set(f"device: {self.device} / reading")
+            self._set_progress_visible(False)
+            worker = threading.Thread(
+                target=self._flat_dump_worker,
+                daemon=True,
+            )
+        worker.start()
+        self.after(50, self._poll_events)
+
+    def _on_mapper_mode_toggle(self) -> None:
+        self._refresh_current_mode_dump()
+
+    def _on_mapper_type_selected(self, _event=None) -> None:
+        if self._updating_mapper_controls:
+            return
+        self._apply_mapper_preset(self.mapper_type_var.get())
+        if self.mapper_enabled_var.get():
+            self._refresh_current_mode_dump()
+        else:
+            self._set_mapper_controls_enabled(False)
+
+    def _on_window_selected(self, _event=None) -> None:
+        self._sync_mapper_type_to_custom()
+        if self.mapper_enabled_var.get():
+            self._refresh_current_mode_dump()
+
+    def _on_switch_addr_changed(self, _event=None) -> str | None:
+        value = self.switch_addr_var.get().strip().upper()
+        if value:
+            self.switch_addr_var.set(value)
+        self._sync_mapper_type_to_custom()
+        if self.mapper_enabled_var.get():
+            try:
+                self._switch_addr_value()
+            except ValueError:
+                messagebox.showerror("入力エラー", "SwitchAddr は16進数で入力してください。")
+                return "break"
+            self._refresh_current_mode_dump()
+        return None
+
+    def _on_bank_changed(self, _event=None) -> str | None:
+        value = self.bank_var.get().strip().upper()
+        if value:
+            self.bank_var.set(value)
+        if self.mapper_enabled_var.get():
+            try:
+                self._bank_value()
+            except ValueError:
+                messagebox.showerror("入力エラー", "Bank は00-FFの16進数で入力してください。")
+                return "break"
+            self._refresh_current_mode_dump()
+        return None
 
     def _open_access_log_dialog(self) -> None:
         if self._access_log_dialog is None or not self._access_log_dialog.winfo_exists():
@@ -1031,8 +1898,79 @@ class AdapterApp(tk.Tk):
             self._manual_dialog.destroy()
         self._manual_dialog = None
 
+    def _open_mapper_map_dialog(self) -> None:
+        if self._mapper_map_dialog is None or not self._mapper_map_dialog.winfo_exists():
+            self._mapper_map_dialog = MapperMapDialog(
+                self,
+                self._start_mapper_map_analysis,
+                self._select_mapper_map_bank,
+            )
+            self._mapper_map_dialog.protocol(
+                "WM_DELETE_WINDOW",
+                self._close_mapper_map_dialog,
+            )
+            self._mapper_map_dialog.set_busy(self._busy)
+        else:
+            self._mapper_map_dialog.lift()
+            self._mapper_map_dialog.focus_set()
+
+    def _close_mapper_map_dialog(self) -> None:
+        if self._mapper_map_dialog is not None and self._mapper_map_dialog.winfo_exists():
+            self._mapper_map_dialog.destroy()
+        self._mapper_map_dialog = None
+
+    def _select_mapper_map_bank(self, bank: int) -> None:
+        if self._busy:
+            return
+        self.bank_var.set(f"{bank:02X}")
+        self._pending_mapper_cursor = (0, 0)
+        if self._adapter is None:
+            self._apply_zero_view()
+            self.hex_viewer.set_cursor_position(0, 0)
+            self.hex_viewer.focus_editor()
+            return
+        self._start_dump_worker()
+
     def _scroll_to_address(self, address: int) -> None:
         self.hex_viewer.scroll_to_address(address)
+
+    def _start_mapper_map_analysis(self) -> None:
+        if self._busy or self._adapter is None:
+            return
+        config = self._validated_dump_config()
+        if config is None or config["mode"] != MAPPER_MODE:
+            return
+        if self._mapper_map_dialog is not None and self._mapper_map_dialog.winfo_exists():
+            self._mapper_map_dialog.reset_cells()
+            self._mapper_map_dialog.set_busy(True)
+        self._set_busy(True)
+        self.status_var.set(f"device: {self.device} / mapper analyze")
+        self._set_progress_visible(True, 0, 0x100)
+        worker = threading.Thread(
+            target=self._mapper_map_worker,
+            args=(config,),
+            daemon=True,
+        )
+        worker.start()
+        self.after(50, self._poll_events)
+
+    def _on_mapper_bank_move(
+        self,
+        target_bank: int,
+        target_offset: int,
+        target_nibble: int,
+    ) -> bool:
+        if self._busy:
+            return False
+        self.bank_var.set(f"{target_bank:02X}")
+        self._pending_mapper_cursor = (target_offset, target_nibble)
+        if self._adapter is None:
+            self._apply_zero_view()
+            self.hex_viewer.set_cursor_position(target_offset, target_nibble)
+            self.hex_viewer.focus_editor()
+            return True
+        self._start_dump_worker()
+        return True
 
     def _save_buffer(self) -> None:
         data = self.hex_viewer.get_data()
@@ -1040,26 +1978,56 @@ class AdapterApp(tk.Tk):
             messagebox.showwarning("保存不可", "保存できるデータがありません。")
             return
 
-        dialog = SaveBufferDialog(self)
+        analyzed_end_bank = "FF"
+        if self._last_analyzed_unique_banks is not None and self._last_analyzed_unique_banks > 0:
+            analyzed_end_bank = f"{min(self._last_analyzed_unique_banks - 1, 0xFF):02X}"
+        dialog = SaveBufferDialog(
+            self,
+            initial_mode="mapper" if self.mapper_enabled_var.get() else "flat",
+            mapper_defaults={
+                "mapper_type": self.mapper_type_var.get(),
+                "window_label": self.window_var.get(),
+                "switch_addr": self.switch_addr_var.get().strip().upper(),
+            },
+            analyzed_end_bank=analyzed_end_bank,
+        )
         result = dialog.show()
         if result is None:
             return
-        path, start_address, end_address = result
-        save_data = data[start_address : end_address + 1]
+        if result["mode"] == "flat":
+            start_address = int(result["start_address"])
+            end_address = int(result["end_address"])
+            save_data = data[start_address : end_address + 1]
 
-        try:
-            with open(path, "wb") as handle:
-                handle.write(save_data)
-        except OSError as exc:
-            messagebox.showerror("保存失敗", str(exc))
+            try:
+                with open(str(result["path"]), "wb") as handle:
+                    handle.write(save_data)
+            except OSError as exc:
+                messagebox.showerror("保存失敗", str(exc))
+                return
+
+            self.status_var.set(f"device: {self.device} / saved / {result['path']}")
+            self._append_access_log(
+                "APP: saved "
+                f"{len(save_data)} bytes to {result['path']} "
+                f"({start_address:04X}-{end_address:04X})"
+            )
             return
 
-        self.status_var.set(f"device: {self.device} / saved / {path}")
-        self._append_access_log(
-            "APP: saved "
-            f"{len(save_data)} bytes to {path} "
-            f"({start_address:04X}-{end_address:04X})"
+        if self._adapter is None:
+            messagebox.showerror("保存失敗", "Mapper 保存には接続中の Adapter が必要です。")
+            return
+        self._set_busy(True)
+        self.status_var.set(f"device: {self.device} / mapper saving")
+        bank_count = int(result["end_bank"]) - int(result["start_bank"]) + 1
+        self._set_progress_visible(True, 0, bank_count)
+        worker = threading.Thread(
+            target=self._mapper_save_worker,
+            args=(result,),
+            daemon=True,
         )
+        worker.start()
+        self.after(50, self._poll_events)
 
     def _open_serial_dialog(self) -> None:
         if self._busy:
@@ -1092,37 +2060,55 @@ class AdapterApp(tk.Tk):
 
     def _on_hex_change(self, changed: bool, count: int) -> None:
         marker = "*" if changed else ""
-        self.title(f"{marker}MSXPLAYer Game Cartidge Adapter")
+        self.title(f"{marker}{APP_TITLE}")
         if changed:
             self.status_var.set(f"device: {self.device} / edited / {count} bytes changed")
 
     def _on_hex_byte_edited(self, offset: int, value: int, next_offset: int) -> None:
         if self._busy or self._adapter is None:
             return
+        worker_config = self._validated_dump_config()
+        if worker_config is None:
+            return
         self._set_busy(True)
         self.status_var.set(
             f"device: {self.device} / direct write / {offset:04X}={value:02X}"
         )
-        worker = threading.Thread(
-            target=self._direct_write_worker,
-            args=(offset, value, next_offset),
-            daemon=True,
-        )
+        if worker_config["mode"] == MAPPER_MODE:
+            worker = threading.Thread(
+                target=self._mapper_direct_write_worker,
+                args=(offset, value, next_offset, worker_config),
+                daemon=True,
+            )
+        else:
+            worker = threading.Thread(
+                target=self._direct_write_worker,
+                args=(offset, value, next_offset),
+                daemon=True,
+            )
         worker.start()
         self.after(50, self._poll_events)
 
     def _start_device_switch(self, device: str, startup: bool = False) -> None:
+        config = self._validated_dump_config()
+        if config is None:
+            return
         self._set_busy(True)
         self.status_var.set(f"device: {device} / connecting")
+        if config["mode"] == MAPPER_MODE:
+            self._current_mapper_window_length = int(config["window_length"])
+            self._set_progress_visible(True, 0, int(config["window_length"]))
+        else:
+            self._set_progress_visible(False)
         worker = threading.Thread(
             target=self._device_switch_worker,
-            args=(device, startup),
+            args=(device, startup, config),
             daemon=True,
         )
         worker.start()
         self.after(50, self._poll_events)
 
-    def _device_switch_worker(self, device: str, startup: bool) -> None:
+    def _device_switch_worker(self, device: str, startup: bool, config: dict[str, object]) -> None:
         started_at = time.monotonic()
         self._publish_app_log(f"device switch start {device}")
         try:
@@ -1148,12 +2134,11 @@ class AdapterApp(tk.Tk):
             self._publish_app_log(
                 f"HVER ok {device} ({time.monotonic() - started_at:.3f}s)"
             )
-            self._event_queue.put(("status", f"device: {device} / reading"))
-            payload = adapter.read_cartridge_64kb(self._publish_progress)
+            payload = self._load_data_for_config(adapter, config)
             self._publish_app_log(
-                f"initial read ok {device} ({time.monotonic() - started_at:.3f}s)"
+                f"initial load ok {device} ({time.monotonic() - started_at:.3f}s)"
             )
-            self._event_queue.put(("loaded", (device, adapter, hver_lines, payload)))
+            self._event_queue.put(("loaded", (device, adapter, hver_lines, payload, config)))
         except Exception as exc:
             adapter.close()
             self._publish_app_log(
@@ -1161,6 +2146,39 @@ class AdapterApp(tk.Tk):
             )
             event_name = "error" if startup else "switch_error"
             self._event_queue.put((event_name, str(exc)))
+
+    def _flat_dump_worker(self) -> None:
+        try:
+            payload = self._adapter.read_cartridge_64kb(self._publish_progress)
+            config = self._build_dump_config()
+            self._event_queue.put(("reloaded", (payload, config)))
+        except Exception as exc:
+            self._event_queue.put(("switch_error", str(exc)))
+
+    def _mapper_dump_worker(self, config: dict[str, object]) -> None:
+        try:
+            payload = self._load_data_for_config(self._adapter, config)
+            self._event_queue.put(("reloaded", (payload, config)))
+        except Exception as exc:
+            self._event_queue.put(("switch_error", str(exc)))
+
+    def _load_data_for_config(self, adapter: CartridgeAdapter, config: dict[str, object]) -> bytes:
+        if config["mode"] == MAPPER_MODE:
+            self._event_queue.put(
+                (
+                    "status",
+                    f"device: {adapter.device} / mapper dumping / bank {int(config['bank']):02X}",
+                )
+            )
+            return adapter.read_mapper_bank(
+                int(config["bank"]),
+                int(config["switch_addr"]),
+                int(config["window_start"]),
+                int(config["window_length"]),
+                self._publish_mapper_progress,
+            )
+        self._event_queue.put(("status", f"device: {adapter.device} / reading"))
+        return adapter.read_cartridge_64kb(self._publish_progress)
 
     def _submit_manual_command(self, command: str) -> None:
         if not command or self._busy or self._adapter is None:
@@ -1190,19 +2208,117 @@ class AdapterApp(tk.Tk):
                 self._publish_progress,
             )
             self._event_queue.put(
-                ("direct_write_done", (offset, value, next_offset, payload))
+                ("flat_direct_write_done", (offset, value, next_offset, payload))
             )
         except Exception as exc:
             self._event_queue.put(("direct_write_error", (offset, value, str(exc))))
+
+    def _mapper_direct_write_worker(
+        self,
+        offset: int,
+        value: int,
+        next_offset: int,
+        config: dict[str, object],
+    ) -> None:
+        try:
+            window_length = int(config["window_length"])
+            bank = int(config["bank"])
+            bank_offset = offset
+            payload = self._adapter.write_mapper_byte_and_read_bank(
+                bank,
+                int(config["switch_addr"]),
+                int(config["window_start"]),
+                window_length,
+                bank_offset,
+                value,
+            )
+            self._event_queue.put(
+                ("mapper_direct_write_done", (offset, value, next_offset, bank, payload, config))
+            )
+        except Exception as exc:
+            self._event_queue.put(("direct_write_error", (offset, value, str(exc))))
+
+    def _mapper_map_worker(self, config: dict[str, object]) -> None:
+        try:
+            hashes: dict[str, int] = {}
+            consecutive_unique_count = 0
+            for bank in range(0x100):
+                payload = self._adapter.read_mapper_bank(
+                    bank,
+                    int(config["switch_addr"]),
+                    int(config["window_start"]),
+                    int(config["window_length"]),
+                )
+                digest = hashlib.sha1(payload).hexdigest()
+                before = hashes.get(digest)
+                if before is None:
+                    hashes[digest] = bank
+                    if bank == consecutive_unique_count:
+                        consecutive_unique_count += 1
+                self._event_queue.put(("mapper_map_progress", (bank + 1, 0x100)))
+                self._event_queue.put(("mapper_map_cell", (bank, before)))
+            image_kbyte = (consecutive_unique_count * int(config["window_length"])) // 1024
+            self._event_queue.put(("mapper_map_done", (image_kbyte, consecutive_unique_count)))
+        except Exception as exc:
+            self._event_queue.put(("mapper_map_error", str(exc)))
+
+    def _mapper_save_worker(self, config: dict[str, object]) -> None:
+        try:
+            window_start, window_length = WINDOW_CONFIGS[str(config["window_label"])]
+            start_bank = int(config["start_bank"])
+            end_bank = int(config["end_bank"])
+            switch_addr = int(config["switch_addr"])
+            dump = bytearray()
+            total_banks = end_bank - start_bank + 1
+            for offset, bank in enumerate(range(start_bank, end_bank + 1), start=1):
+                payload = self._adapter.read_mapper_bank(
+                    bank,
+                    switch_addr,
+                    window_start,
+                    window_length,
+                )
+                dump.extend(payload)
+                self._event_queue.put(("mapper_save_progress", (offset, total_banks)))
+            with open(str(config["path"]), "wb") as handle:
+                handle.write(dump)
+            self._event_queue.put(
+                (
+                    "mapper_save_done",
+                    (
+                        str(config["path"]),
+                        len(dump),
+                        start_bank,
+                        end_bank,
+                        str(config["mapper_type"]),
+                        str(config["window_label"]),
+                        switch_addr,
+                    ),
+                )
+            )
+        except Exception as exc:
+            self._event_queue.put(("mapper_save_error", str(exc)))
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         if self._manual_dialog is not None and self._manual_dialog.winfo_exists():
             self._manual_dialog.set_busy(busy or self._adapter is None)
+        if self._mapper_map_dialog is not None and self._mapper_map_dialog.winfo_exists():
+            self._mapper_map_dialog.set_busy(busy)
         self.hex_viewer.set_editable(not busy)
+        self.mapper_toggle.configure(state="disabled" if busy else "normal")
+        if busy:
+            self.mapper_type_combo.configure(state="disabled")
+            self.window_combo.configure(state="disabled")
+            self.switch_addr_combo.configure(state="disabled")
+            self.bank_spinbox.configure(state="disabled")
+        else:
+            self._set_mapper_controls_enabled(self.mapper_enabled_var.get())
 
     def _publish_progress(self, last_address: int) -> None:
         return None
+
+    def _publish_mapper_progress(self, last_address: int) -> None:
+        self._event_queue.put(("mapper_progress", (last_address + 1, self._current_mapper_window_length)))
 
     def _publish_log(self, direction: str, payload: str) -> None:
         self._event_queue.put(("log", f"{direction}: {payload}"))
@@ -1220,20 +2336,99 @@ class AdapterApp(tk.Tk):
 
             if event == "status":
                 self.status_var.set(str(payload))
+            elif event == "mapper_progress":
+                done_bytes, total_bytes = payload
+                self._set_progress_visible(True, done_bytes, total_bytes)
+            elif event == "mapper_map_progress":
+                done_banks, total_banks = payload
+                self._set_progress_visible(True, done_banks, total_banks)
+            elif event == "mapper_map_cell":
+                bank, before = payload
+                if self._mapper_map_dialog is not None and self._mapper_map_dialog.winfo_exists():
+                    if before is None:
+                        self._mapper_map_dialog.mark_unique(bank)
+                    else:
+                        self._mapper_map_dialog.mark_mirror(bank, before)
+            elif event == "mapper_map_done":
+                image_kbyte, unique_banks = payload
+                self._last_analyzed_unique_banks = int(unique_banks)
+                self.status_var.set(f"device: {self.device} / mapper analyze done")
+                if self._mapper_map_dialog is not None and self._mapper_map_dialog.winfo_exists():
+                    window_kbyte = self._current_mapper_window_length // 1024
+                    bank_count = int(unique_banks)
+                    self._mapper_map_dialog.set_image_size(
+                        f"{bank_count} Bank * {window_kbyte}kB = {int(image_kbyte)} kByte"
+                    )
+                self._set_progress_visible(False)
+                self._set_busy(False)
+            elif event == "mapper_map_error":
+                self.status_var.set(f"device: {self.device} / mapper analyze error")
+                self._set_progress_visible(False)
+                self._set_busy(False)
+                self.after(
+                    0,
+                    lambda m=str(payload): messagebox.showerror(
+                        "Mapper 解析失敗",
+                        m,
+                    ),
+                )
+            elif event == "mapper_save_progress":
+                done_banks, total_banks = payload
+                self._set_progress_visible(True, done_banks, total_banks)
+            elif event == "mapper_save_done":
+                path, size, start_bank, end_bank, mapper_type, window_label, switch_addr = payload
+                self.status_var.set(f"device: {self.device} / saved / {path}")
+                self._set_progress_visible(False)
+                self._set_busy(False)
+                self._append_access_log(
+                    "APP: saved "
+                    f"{size} bytes to {path} "
+                    f"(mapper {mapper_type}, {window_label}, switch {switch_addr:04X}, "
+                    f"bank {start_bank:02X}-{end_bank:02X})"
+                )
+            elif event == "mapper_save_error":
+                self.status_var.set(f"device: {self.device} / mapper save error")
+                self._set_progress_visible(False)
+                self._set_busy(False)
+                self.after(
+                    0,
+                    lambda m=str(payload): messagebox.showerror(
+                        "保存失敗",
+                        m,
+                    ),
+                )
             elif event == "log":
                 self._append_access_log(str(payload))
             elif event == "loaded":
-                device, adapter, hver_lines, data = payload
+                device, adapter, hver_lines, data, config = payload
                 if self._adapter is not None:
                     self._adapter.close()
                 self._adapter = adapter
                 self.device = device
                 self.selected_device = device
-                self.buffer = data
-                self.hex_viewer.set_data(self.buffer)
+                self._apply_loaded_data(data, config)
                 self.status_var.set(
                     f"device: {self.device} / ready / {' | '.join(hver_lines)}"
                 )
+                if self._pending_mapper_cursor is not None and self._current_mode == MAPPER_MODE:
+                    offset, nibble = self._pending_mapper_cursor
+                    self.hex_viewer.set_cursor_position(offset, nibble)
+                    self.hex_viewer.focus_editor()
+                self._pending_mapper_cursor = None
+                self._set_progress_visible(False)
+                self._set_mapper_controls_enabled(self.mapper_enabled_var.get())
+                self._set_busy(False)
+            elif event == "reloaded":
+                data, config = payload
+                self._apply_loaded_data(data, config)
+                self.status_var.set(f"device: {self.device} / ready")
+                if self._pending_mapper_cursor is not None and self._current_mode == MAPPER_MODE:
+                    offset, nibble = self._pending_mapper_cursor
+                    self.hex_viewer.set_cursor_position(offset, nibble)
+                    self.hex_viewer.focus_editor()
+                self._pending_mapper_cursor = None
+                self._set_progress_visible(False)
+                self._set_mapper_controls_enabled(self.mapper_enabled_var.get())
                 self._set_busy(False)
             elif event == "command_done":
                 command, response, source = payload
@@ -1258,11 +2453,12 @@ class AdapterApp(tk.Tk):
                         "コマンド失敗", f"{c}\n\n{m}"
                     ),
                 )
-            elif event == "direct_write_done":
+            elif event == "flat_direct_write_done":
                 offset, value, next_offset, data = payload
+                self.flat_buffer = data
                 self.buffer = data
                 self.hex_viewer.set_data(
-                    self.buffer,
+                    data,
                     cursor_offset=next_offset,
                     cursor_nibble=0,
                     keep_view=True,
@@ -1272,9 +2468,26 @@ class AdapterApp(tk.Tk):
                     f"device: {self.device} / direct write done / {offset:04X}={value:02X}"
                 )
                 self._set_busy(False)
+            elif event == "mapper_direct_write_done":
+                offset, value, next_offset, bank, payload, config = payload
+                self.mapper_buffer = payload
+                self.buffer = self.mapper_buffer
+                self.hex_viewer.set_data(
+                    payload,
+                    cursor_offset=next_offset,
+                    cursor_nibble=0,
+                    keep_view=True,
+                )
+                self.hex_viewer.focus_editor()
+                self.status_var.set(
+                    f"device: {self.device} / direct write done / bank {bank:02X} / {offset:04X}={value:02X}"
+                )
+                self._set_progress_visible(False)
+                self._set_busy(False)
             elif event == "direct_write_error":
                 offset, value, message = payload
                 self.status_var.set(f"device: {self.device} / direct write error")
+                self._set_progress_visible(False)
                 self._set_busy(False)
                 self.after(
                     0,
@@ -1284,7 +2497,11 @@ class AdapterApp(tk.Tk):
                     ),
                 )
             elif event == "error":
-                self.status_var.set("device: not selected / error")
+                if self.selected_device:
+                    self.status_var.set(f"device: {self.selected_device} / error")
+                else:
+                    self.status_var.set("device: not selected / error")
+                self._set_progress_visible(False)
                 self._set_busy(False)
                 self.after(
                     0,
@@ -1295,9 +2512,12 @@ class AdapterApp(tk.Tk):
                 )
             elif event == "switch_error":
                 if self._adapter is None:
-                    self.status_var.set("device: not selected / select serial")
+                    self.status_var.set(self._disconnected_status())
                 else:
                     self.status_var.set(f"device: {self.device} / ready")
+                self._set_progress_visible(False)
+                self._set_mapper_controls_enabled(self.mapper_enabled_var.get())
+                self._pending_mapper_cursor = None
                 self._set_busy(False)
                 self.after(
                     0,
